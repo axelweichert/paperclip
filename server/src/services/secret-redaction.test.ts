@@ -61,6 +61,77 @@ describe("redactSecrets — Cloudflare Access tokens", () => {
   });
 });
 
+describe("redactSecrets — Cloudflare API tokens (cfu_)", () => {
+  it("redacts a cfu_ API token", () => {
+    const token = "cfu_" + "Ab3xYz9".repeat(6); // hyphen/underscore-class, >8 chars
+    const out = redactSecrets(`token ${token} end`);
+    expect(out).not.toContain(token);
+    expect(out).toContain("***REDACTED:cf_api***");
+  });
+
+  it("redacts a cfu_ token containing hyphens (escapes the high-entropy pass)", () => {
+    const token = "cfu_v1-0-aaaa-bbbb-cccc-dddd";
+    const out = redactSecrets(`CLOUDFLARE_API_TOKEN=${token}`);
+    expect(out).not.toContain(token);
+    expect(out).toMatch(/\*\*\*REDACTED:/);
+  });
+});
+
+describe("redactSecrets — inline URL credentials", () => {
+  it("redacts x-access-token:<PAT>@github.com from git remote output", () => {
+    const pat = "ghp_" + "r".repeat(40);
+    const text = `https://x-access-token:${pat}@github.com/axelweichert/paperclip.git`;
+    const out = redactSecrets(text);
+    expect(out).not.toContain(pat);
+    expect(out).toContain("x-access-token:");
+    expect(out).toContain("@github.com");
+    expect(out).toMatch(/\*\*\*REDACTED:/);
+  });
+
+  it("redacts a SHORT, low-entropy URL password the entropy pass would miss", () => {
+    const text = "postgres://app:hunter2@db.internal:5432/main";
+    const out = redactSecrets(text);
+    expect(out).not.toContain("hunter2");
+    expect(out).toContain("postgres://app:***REDACTED:url_credential***@");
+  });
+
+  it("is idempotent on an already-redacted URL credential", () => {
+    const once = redactSecrets("https://u:s3cr3tpw@host/x");
+    const twice = redactSecrets(once);
+    expect(twice).toBe(once);
+  });
+});
+
+describe("redactSecrets — labeled env-var secrets", () => {
+  it("redacts GITHUB_TOKEN=<value> env dumps", () => {
+    const text = "GITHUB_TOKEN=ghp_" + "q".repeat(40);
+    const out = redactSecrets(text);
+    expect(out).not.toContain("ghp_q");
+    expect(out).toContain("GITHUB_TOKEN=");
+    expect(out).toMatch(/\*\*\*REDACTED:/);
+  });
+
+  it("redacts a token whose KEY has a suffix (TOKEN not at the end)", () => {
+    const text = "GITHUB_TOKEN_AXELWEICHERTVB=abc-def-ghi-jkl-mno-pqr";
+    const out = redactSecrets(text);
+    expect(out).not.toContain("abc-def-ghi-jkl-mno-pqr");
+    expect(out).toContain("GITHUB_TOKEN_AXELWEICHERTVB=");
+    expect(out).toContain("***REDACTED:env_secret***");
+  });
+
+  it("redacts CLOUDFLARE_API_TOKEN values", () => {
+    const text = 'CLOUDFLARE_API_TOKEN: "some-cf-api-token-value-1234"';
+    const out = redactSecrets(text);
+    expect(out).not.toContain("some-cf-api-token-value-1234");
+    expect(out).toMatch(/\*\*\*REDACTED:/);
+  });
+
+  it("leaves a benign non-secret KEY=value alone", () => {
+    const text = "LOG_LEVEL=debug";
+    expect(redactSecrets(text)).toBe(text);
+  });
+});
+
 describe("redactSecrets — generic high-entropy", () => {
   it("redacts a >=40 char [A-Za-z0-9_] string", () => {
     const blob = "AbcDef0123_GhiJkl4567MnoPqr8901StuVwxYz2";
