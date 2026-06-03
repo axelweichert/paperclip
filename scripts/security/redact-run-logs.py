@@ -1,21 +1,26 @@
 #!/usr/bin/env python3
 """
-OWL-174 retroactive redaction for Paperclip run-logs.
+OWL-174 / WEI-218 retroactive redaction for Paperclip run-logs AND Claude transcripts.
 
-For each .ndjson under data/run-logs/, scan for secret patterns.
-On match:
+For each matching file under --scan-dir (default glob *.ndjson for run-logs; pass
+--glob '*.jsonl' to scrub Claude transcripts under ~/.claude/projects), scan for
+secret patterns. On match:
   1. Copy the original file to quarantine dir (preserving relative path) for audit.
-  2. Rewrite the file in-place with all token matches replaced by ***REDACTED:<prefix>***
+  2. Rewrite the file in-place with all token matches replaced by ***REDACTED:<tag>***
   3. Append a JSON record to the audit log with original sha256, redacted sha256, and match count.
 
-Patterns (must mirror redaction.ts):
+Patterns (must mirror server/src/services/secret-redaction.ts):
+  - Inline URL credentials: scheme://user:secret@host (password redacted even when low-entropy)
   - GitHub: ghp_, github_pat_, gho_, ghu_, ghs_, ghr_ followed by [A-Za-z0-9_]{20,255}
+  - Cloudflare API token: cfu_ followed by [A-Za-z0-9_-]{8,255}
+  - Labeled env-var secret: KEY containing TOKEN/SECRET/PASSWORD/API_KEY/... = VALUE
   - Cloudflare Access service token client_secret: 64-hex chars adjacent to "client_secret"/"CF-Access-Client-Secret"
-  - Generic high-entropy: >=40 chars of [A-Za-z0-9_], rejected if mostly one char or matches a known low-entropy header
+  - Generic high-entropy: >=40 chars of [A-Za-z0-9_], rejected if mostly one char or all-digits
 
-For run-log redaction, the chunk content is a JSON-escaped string (since it lives inside an ndjson "chunk" field).
-We operate on the raw line bytes — pattern hits work the same whether content is in JSON-escape form or not,
-because the secret characters survive JSON string-escaping (they're all ASCII alnum + underscore).
+The content lives inside a JSON-escaped string (the ndjson "chunk" field, or a
+transcript jsonl line). We operate on the raw line text — pattern hits work the same
+whether content is in JSON-escape form or not, because the secret characters survive
+JSON string-escaping (they're all ASCII alnum + underscore + hyphen).
 """
 import argparse
 import hashlib
@@ -31,6 +36,20 @@ GITHUB_PREFIXES = ("ghp_", "github_pat_", "gho_", "ghu_", "ghs_", "ghr_")
 # Token: prefix + 20..255 alnum/underscore (covers classic 40 char + fine-grained 80+ char).
 GITHUB_RE = re.compile(
     r"(ghp_|github_pat_|gho_|ghu_|ghs_|ghr_)[A-Za-z0-9_]{20,255}"
+)
+
+# Cloudflare API token (user-scoped form is prefixed cfu_).
+CF_API_TOKEN_RE = re.compile(r"cfu_[A-Za-z0-9_-]{8,255}")
+
+# Inline URL credentials: scheme://user:secret@host — redact the password segment.
+URL_CREDENTIAL_RE = re.compile(
+    r"([a-zA-Z][a-zA-Z0-9+.-]*://)([^/\s:@]+):([^/\s@]+)@"
+)
+
+# Labeled env-var / KEY=VALUE secret whose key name contains a secret keyword anywhere.
+LABELED_SECRET_RE = re.compile(
+    r"\b([A-Z][A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY|ACCESS_KEY|PRIVATE_KEY|CREDENTIALS?)[A-Z0-9_]*)"
+    r"(\s*[:=]\s*)([\"']?)([^\s\"']{6,})\3"
 )
 
 # Cloudflare Access service-token client_secret = 64 lowercase hex.
@@ -55,8 +74,21 @@ def is_low_entropy(s: str) -> bool:
     return False
 
 
+def _already_redacted(value: str) -> bool:
+    return "REDACTED" in value
+
+
 def redact_text(text: str) -> tuple[str, int]:
     hits = 0
+
+    def url_sub(m):
+        nonlocal hits
+        if _already_redacted(m.group(3)):
+            return m.group(0)
+        hits += 1
+        return f"{m.group(1)}{m.group(2)}:***REDACTED:url_credential***@"
+
+    out = URL_CREDENTIAL_RE.sub(url_sub, text)
 
     def gh_sub(m):
         nonlocal hits
@@ -64,7 +96,23 @@ def redact_text(text: str) -> tuple[str, int]:
         prefix = m.group(1).rstrip("_")
         return f"***REDACTED:{prefix}***"
 
-    out = GITHUB_RE.sub(gh_sub, text)
+    out = GITHUB_RE.sub(gh_sub, out)
+
+    def cf_api_sub(m):
+        nonlocal hits
+        hits += 1
+        return "***REDACTED:cf_api***"
+
+    out = CF_API_TOKEN_RE.sub(cf_api_sub, out)
+
+    def labeled_sub(m):
+        nonlocal hits
+        if _already_redacted(m.group(4)):
+            return m.group(0)
+        hits += 1
+        return f"{m.group(1)}{m.group(2)}{m.group(3)}***REDACTED:env_secret***{m.group(3)}"
+
+    out = LABELED_SECRET_RE.sub(labeled_sub, out)
 
     def cf_sub(m):
         nonlocal hits
@@ -94,13 +142,19 @@ def sha256_bytes(b: bytes) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--run-logs-dir", required=True)
+    # --scan-dir is preferred; --run-logs-dir kept for backwards compatibility.
+    parser.add_argument("--scan-dir", "--run-logs-dir", dest="scan_dir", required=True)
+    parser.add_argument(
+        "--glob",
+        default="*.ndjson",
+        help="filename glob to scan (default *.ndjson; use *.jsonl for ~/.claude/projects transcripts)",
+    )
     parser.add_argument("--quarantine-dir", required=True)
     parser.add_argument("--audit-log", required=True)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
-    run_logs = Path(args.run_logs_dir)
+    run_logs = Path(args.scan_dir)
     quarantine = Path(args.quarantine_dir)
     audit = Path(args.audit_log)
     quarantine.mkdir(parents=True, exist_ok=True)
@@ -111,10 +165,16 @@ def main() -> int:
     total_hits = 0
 
     needle_patterns = [re.compile(re.escape(p)) for p in GITHUB_PREFIXES]
-    cf_marker = re.compile(r"client_secret|CF-Access-Client-Secret", re.IGNORECASE)
+    # Fast pre-check markers covering every pattern above.
+    hint_marker = re.compile(
+        r"client_secret|CF-Access-Client-Secret|cfu_"
+        r"|://[^/\s:@]+:[^/\s@]+@"
+        r"|(?:TOKEN|SECRET|PASSWORD|API_?KEY|ACCESS_KEY|PRIVATE_KEY|CREDENTIAL)[A-Z0-9_]*\s*[:=]",
+        re.IGNORECASE,
+    )
 
     with audit.open("a") as audit_fp:
-        for path in run_logs.rglob("*.ndjson"):
+        for path in run_logs.rglob(args.glob):
             processed += 1
             try:
                 raw = path.read_bytes()
@@ -123,10 +183,10 @@ def main() -> int:
 
             text = raw.decode("utf-8", errors="replace")
 
-            # Fast pre-check: only scan files that contain one of the prefixes/CF markers.
+            # Fast pre-check: only scan files that contain a likely secret marker.
             has_gh = any(p.search(text) for p in needle_patterns)
-            has_cf = bool(cf_marker.search(text))
-            if not (has_gh or has_cf):
+            has_hint = bool(hint_marker.search(text))
+            if not (has_gh or has_hint):
                 continue
 
             new_text, hits = redact_text(text)
