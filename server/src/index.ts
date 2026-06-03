@@ -39,6 +39,7 @@ import {
   routineService,
 } from "./services/index.js";
 import { createFeedbackTraceShareClientFromConfig } from "./services/feedback-share-client.js";
+import { startTranscriptRedactionSweeper } from "./services/transcript-redaction.js";
 import { buildRuntimeApiCandidateUrls, choosePrimaryRuntimeApiUrl } from "./runtime-api.js";
 import { createPluginWorkerManager } from "./services/plugin-worker-manager.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
@@ -690,6 +691,12 @@ export async function startServer(): Promise<StartedServer> {
     resolveSessionFromHeaders,
   });
 
+  // Scrub-on-write guard for Claude Code transcripts (~/.claude/projects/*.jsonl),
+  // which the harness writes directly and which therefore bypass the run-log
+  // redaction filter (WEI-217 / WEI-218). Best-effort; gated by
+  // PAPERCLIP_TRANSCRIPT_REDACTION (default on).
+  const transcriptRedactionSweeper = startTranscriptRedactionSweeper();
+
   void reconcilePersistedRuntimeServicesOnStartup(db as any)
     .then((result) => {
       if (result.reconciled > 0) {
@@ -924,6 +931,8 @@ export async function startServer(): Promise<StartedServer> {
         telemetryClient.stop();
         await telemetryClient.flush();
       }
+
+      transcriptRedactionSweeper.stop();
 
       const appShutdown = (app as { locals?: { paperclipShutdown?: () => void } }).locals?.paperclipShutdown;
       appShutdown?.();
