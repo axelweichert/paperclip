@@ -15,15 +15,24 @@
  * (`***REDACTED:…***`) are valid inside a JSON string, so rewriting in place keeps
  * the transcript parseable.
  *
+ * The `SECRET_HINT_RE` pre-check is kept a *superset* of `redactSecrets()`: it
+ * carries the high-entropy fallback as well as the labeled/prefixed forms, so a
+ * naked high-entropy token (no prefix/label) that `redactSecrets()` would shred
+ * via `HIGH_ENTROPY_RE` still trips the pre-check and is scrubbed (WEI-222 F1).
+ * A hint hit only gates the (possibly false-positive) full read+filter; the
+ * filter itself is authoritative for what is actually redacted.
+ *
  * On a hit the original file is copied to a quarantine dir for audit, rewritten
  * atomically, and a JSON record (original/redacted sha256 + byte counts) is
  * appended to an audit log — mirroring scripts/security/redact-run-logs.py.
  *
  * `startTranscriptRedactionSweeper()` wires this as a scrub-on-write guard: a
  * sweep at boot plus a short-interval periodic sweep. (A periodic sweep is used
- * rather than `fs.watch`, which is not reliably recursive on Linux; the fast
- * pre-check below means clean files are never rewritten, so the steady-state
- * cost is a cheap directory walk.)
+ * rather than `fs.watch`, which is not reliably recursive on Linux.) The sweep
+ * stats each file and skips ones that are unchanged since the last sweep
+ * (mtime+size cache) or were modified in the last few seconds (an active
+ * writer), so the steady-state cost is a `stat()` per file rather than a full
+ * read of every transcript every interval (WEI-222 F2/F3).
  */
 import { createHash } from "node:crypto";
 import os from "node:os";
@@ -51,13 +60,41 @@ export interface TranscriptScrubFileResult {
 export interface TranscriptScrubSummary {
   processedFiles: number;
   redactedFiles: number;
+  /** Files skipped via the mtime/size cache (F2) or recent-write guard (F3). */
+  skippedFiles: number;
   dryRun: boolean;
 }
 
+/** Per-file stat fingerprint used to skip unchanged files between sweeps. */
+interface FileStat {
+  mtimeMs: number;
+  size: number;
+}
+
+/**
+ * Optional state threaded through a sweep so repeated sweeps are cheap and don't
+ * race live writers:
+ *  - `cache`: path -> last-seen {mtimeMs,size}; unchanged files are skipped (F2).
+ *  - `skipRecentMs`: skip files modified within this window — an active session's
+ *    transcript whose fd the harness still holds, where an atomic rename could
+ *    drop appends (F3). Default 0 (no skip) for one-off CLI/retroactive runs;
+ *    the periodic sweeper sets it to 5s.
+ *  - `now`: injectable clock for tests.
+ */
+export interface TranscriptSweepState {
+  cache?: Map<string, FileStat>;
+  skipRecentMs?: number;
+  now?: () => number;
+}
+
 // Cheap markers that indicate a file *might* contain a redactable secret, so we
-// can skip reading/scrubbing the (vast majority of) clean transcript files.
+// can skip reading/scrubbing the (vast majority of) clean transcript files. The
+// final `[A-Za-z0-9_]{40,255}` alternative mirrors `redactSecrets()`'
+// `HIGH_ENTROPY_RE` so a naked high-entropy token (no prefix/label) is not
+// silently passed through the pre-check (WEI-222 F1). A match here only triggers
+// the authoritative filter; `redactSecrets()` still decides what is redacted.
 const SECRET_HINT_RE =
-  /ghp_|github_pat_|gho_|ghu_|ghs_|ghr_|cfu_|client_secret|CF-Access-Client-Secret|:\/\/[^/\s:@]+:[^/\s@]+@|(?:TOKEN|SECRET|PASSWORD|API_?KEY|ACCESS_KEY|PRIVATE_KEY|CREDENTIAL)[A-Z0-9_]*\s*[:=]/;
+  /ghp_|github_pat_|gho_|ghu_|ghs_|ghr_|cfu_|client_secret|CF-Access-Client-Secret|:\/\/[^/\s:@]+:[^/\s@]+@|(?:TOKEN|SECRET|PASSWORD|API_?KEY|ACCESS_KEY|PRIVATE_KEY|CREDENTIAL)[A-Z0-9_]*\s*[:=]|[A-Za-z0-9_]{40,255}/;
 
 function sha256(buf: Buffer): string {
   return createHash("sha256").update(buf).digest("hex");
@@ -171,18 +208,57 @@ export async function scrubTranscriptFile(
 export async function scrubTranscriptDirs(
   dirs: string[],
   opts: TranscriptScrubOptions,
+  state: TranscriptSweepState = {},
 ): Promise<TranscriptScrubSummary> {
+  const cache = state.cache;
+  const skipRecentMs = state.skipRecentMs ?? 0;
+  const now = state.now ? state.now() : Date.now();
   let processedFiles = 0;
   let redactedFiles = 0;
+  let skippedFiles = 0;
   for (const dir of dirs) {
     const files = await walkJsonl(dir);
     for (const file of files) {
+      let st;
+      try {
+        st = await fs.stat(file);
+      } catch {
+        cache?.delete(file);
+        continue;
+      }
+
+      // F3: don't touch a transcript an active session may still be appending
+      // to — an atomic rename over a held fd loses writes made after our read.
+      if (skipRecentMs > 0 && now - st.mtimeMs < skipRecentMs) {
+        skippedFiles++;
+        continue;
+      }
+
+      // F2: skip files unchanged since we last inspected them. Steady-state
+      // cost is then one stat() per file instead of a full read every sweep.
+      const prev = cache?.get(file);
+      if (prev && prev.mtimeMs === st.mtimeMs && prev.size === st.size) {
+        skippedFiles++;
+        continue;
+      }
+
       processedFiles++;
       const res = await scrubTranscriptFile(file, opts);
       if (res.changed) redactedFiles++;
+
+      // Record the post-scrub fingerprint (a rewrite changes mtime/size) so the
+      // next sweep skips it rather than re-reading a now-clean file forever.
+      if (cache) {
+        try {
+          const after = await fs.stat(file);
+          cache.set(file, { mtimeMs: after.mtimeMs, size: after.size });
+        } catch {
+          cache.delete(file);
+        }
+      }
     }
   }
-  return { processedFiles, redactedFiles, dryRun: opts.dryRun === true };
+  return { processedFiles, redactedFiles, skippedFiles, dryRun: opts.dryRun === true };
 }
 
 export interface TranscriptRedactionSweeperHandle {
@@ -210,9 +286,14 @@ export function startTranscriptRedactionSweeper(options?: {
   const scrubOptions = options?.scrubOptions ?? defaultTranscriptScrubOptions();
   const intervalMs = options?.intervalMs ?? 30_000;
 
+  // Persisted across sweeps so unchanged files are skipped (F2). The 5s
+  // recent-write guard (F3) avoids racing transcripts an active session holds.
+  const cache = new Map<string, FileStat>();
+  const sweepState: TranscriptSweepState = { cache, skipRecentMs: 5_000 };
+
   const sweepNow = async (): Promise<TranscriptScrubSummary> => {
     try {
-      const summary = await scrubTranscriptDirs(dirs, scrubOptions);
+      const summary = await scrubTranscriptDirs(dirs, scrubOptions, sweepState);
       if (summary.redactedFiles > 0) {
         logger.warn(
           { ...summary, dirs },
@@ -222,7 +303,7 @@ export function startTranscriptRedactionSweeper(options?: {
       return summary;
     } catch (err) {
       logger.error({ err, dirs }, "transcript redaction sweep failed");
-      return { processedFiles: 0, redactedFiles: 0, dryRun: false };
+      return { processedFiles: 0, redactedFiles: 0, skippedFiles: 0, dryRun: false };
     }
   };
 

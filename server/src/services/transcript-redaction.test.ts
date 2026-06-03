@@ -73,6 +73,22 @@ describe("scrubTranscriptFile", () => {
     expect(record.redactedSha256).not.toBe(record.originalSha256);
   });
 
+  it("scrubs a naked high-entropy token with no prefix or label (WEI-222 F1)", async () => {
+    // No ghp_/cfu_/TOKEN= marker — only redactSecrets()' HIGH_ENTROPY_RE would
+    // catch it. The pre-check must still let it through to the filter.
+    const token = "aB3dE7fG9hJ2kL5mN8pQ1rS4tU6vW0xYz7cD1eF4gH";
+    expect(token.length).toBeGreaterThanOrEqual(40);
+    const file = path.join(tmpRoot, "naked.jsonl");
+    const line = JSON.stringify({ type: "tool_result", content: `value=${token}` }) + "\n";
+    await fs.writeFile(file, line);
+
+    const res = await scrubTranscriptFile(file, opts());
+    expect(res.changed).toBe(true);
+    const after = await fs.readFile(file, "utf8");
+    expect(after).not.toContain(token);
+    expect(after).toMatch(/\*\*\*REDACTED:high_entropy/);
+  });
+
   it("does not touch a clean transcript file", async () => {
     const file = path.join(tmpRoot, "clean.jsonl");
     const content = JSON.stringify({ type: "user", text: "hello world, no secrets here" }) + "\n";
@@ -105,6 +121,49 @@ describe("scrubTranscriptDirs", () => {
     const summary = await scrubTranscriptDirs([path.join(tmpRoot, "projects")], opts());
     expect(summary.processedFiles).toBe(2);
     expect(summary.redactedFiles).toBe(1);
+  });
+
+  it("skips files unchanged since the last sweep via the mtime/size cache (WEI-222 F2)", async () => {
+    const dir = path.join(tmpRoot, "projects");
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "clean.jsonl"), JSON.stringify({ text: "nothing here" }) + "\n");
+
+    const cache = new Map();
+    const first = await scrubTranscriptDirs([dir], opts(), { cache });
+    expect(first.processedFiles).toBe(1);
+    expect(first.skippedFiles).toBe(0);
+
+    // Same cache, file untouched -> the second sweep reads nothing.
+    const second = await scrubTranscriptDirs([dir], opts(), { cache });
+    expect(second.processedFiles).toBe(0);
+    expect(second.skippedFiles).toBe(1);
+  });
+
+  it("skips transcripts modified within the recent-write window (WEI-222 F3)", async () => {
+    const dir = path.join(tmpRoot, "projects");
+    await fs.mkdir(dir, { recursive: true });
+    const file = path.join(dir, "live.jsonl");
+    await fs.writeFile(file, JSON.stringify({ text: "GH=ghp_" + "x".repeat(40) }) + "\n");
+    const st = await fs.stat(file);
+
+    // Clock pinned just after the file's mtime -> inside the 5s active-writer
+    // window, so the live transcript is left alone.
+    const skipped = await scrubTranscriptDirs([dir], opts(), {
+      skipRecentMs: 5_000,
+      now: () => st.mtimeMs + 1_000,
+    });
+    expect(skipped.processedFiles).toBe(0);
+    expect(skipped.skippedFiles).toBe(1);
+    expect(await fs.readFile(file, "utf8")).toContain("ghp_x");
+
+    // Clock advanced past the window -> the (now-quiescent) file is scrubbed.
+    const scrubbed = await scrubTranscriptDirs([dir], opts(), {
+      skipRecentMs: 5_000,
+      now: () => st.mtimeMs + 10_000,
+    });
+    expect(scrubbed.processedFiles).toBe(1);
+    expect(scrubbed.redactedFiles).toBe(1);
+    expect(await fs.readFile(file, "utf8")).not.toContain("ghp_x");
   });
 });
 
